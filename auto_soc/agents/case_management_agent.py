@@ -9,11 +9,9 @@ Given a SIEMAlert, the agent autonomously:
 """
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
-from pathlib import Path
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-
 from pydantic_ai import Agent, RunContext
+from auto_soc.utils.ollama_model import make_ollama_model
+from auto_soc.config import settings
 
 from auto_soc.models.siem import SIEMAlert, SIEMEvent
 from auto_soc.models.threat_intel import IOC, TTP
@@ -30,7 +28,7 @@ class CaseManagementDeps:
 
 
 case_management_agent = Agent(
-    "google-gla:gemini-2.0-flash-lite",
+    make_ollama_model(),
     deps_type=CaseManagementDeps,
     output_type=AnalystReasoning,
     system_prompt="""You are a Tier 2 SOC Analyst at a financial institution.

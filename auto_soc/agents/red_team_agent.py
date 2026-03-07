@@ -10,11 +10,9 @@ import random
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
-from pathlib import Path
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-
 from pydantic_ai import Agent, RunContext
+from auto_soc.utils.ollama_model import make_ollama_model
+from auto_soc.config import settings
 
 from auto_soc.models.siem import SIEMEvent, CorrelationRule
 from auto_soc.models.red_team import AttackPhase, AttackScenario, RedTeamConfig
@@ -32,7 +30,7 @@ class RedTeamDeps:
 
 
 red_team_agent = Agent(
-    "google-gla:gemini-2.0-flash-lite",
+    make_ollama_model(),
     deps_type=RedTeamDeps,
     output_type=AttackScenario,
     system_prompt="""You are a Red Team Operator running an adversary simulation.

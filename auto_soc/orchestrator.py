@@ -12,8 +12,37 @@ Phases:
 """
 import uuid
 import asyncio
+import logging
+import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+# Emit to stdout so `tee` captures it alongside print() output.
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+))
+
+# Show every tool call and LLM message from PydanticAI
+logging.getLogger("pydantic_ai").setLevel(logging.DEBUG)
+logging.getLogger("pydantic_ai").addHandler(_handler)
+logging.getLogger("pydantic_ai").propagate = False
+
+# Also capture httpx so we can see the raw Ollama requests/responses
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("httpx").addHandler(_handler)
+logging.getLogger("httpx").propagate = False
+
+# Our own logger for orchestrator events
+log = logging.getLogger("auto_soc")
+log.setLevel(logging.DEBUG)
+log.addHandler(_handler)
+log.propagate = False
+
+# Agent timeout in seconds — bail if the LLM loops forever
+AGENT_TIMEOUT = 180
 
 from auto_soc.models.threat_intel import RelevanceConfig
 from auto_soc.models.red_team import RedTeamConfig
@@ -126,11 +155,15 @@ async def run_simulation(config: SimulationConfig | None = None) -> RunReport:
         scenarios=rt_scenarios,
     )
 
-    rt_result = await red_team_agent.run(
-        "Analyse the watchlist and available endpoints. Plan and execute a realistic "
-        "multi-phase attack scenario using exact IOC values from the watchlist. "
-        "Target a workstation endpoint. Follow ATT&CK kill chain ordering.",
-        deps=rt_deps,
+    log.info("Red team agent starting (timeout=%ds)...", AGENT_TIMEOUT)
+    rt_result = await asyncio.wait_for(
+        red_team_agent.run(
+            "Analyse the watchlist and available endpoints. Plan and execute a realistic "
+            "multi-phase attack scenario using exact IOC values from the watchlist. "
+            "Target a workstation endpoint. Follow ATT&CK kill chain ordering.",
+            deps=rt_deps,
+        ),
+        timeout=AGENT_TIMEOUT,
     )
     scenario = rt_result.output
     attack_event_count = sum(len(p.generated_events) for p in scenario.phases)
@@ -160,12 +193,16 @@ async def run_simulation(config: SimulationConfig | None = None) -> RunReport:
             threat_intel=ti,
             incidents=incidents,
         )
-        cm_result = await case_management_agent.run(
-            f"Investigate alert {alert.alert_id}. "
-            f"Rule: '{alert.rule.name}'. "
-            f"Matched events: {len(alert.matched_events)}. "
-            f"Matched IOCs: {alert.matched_iocs}.",
-            deps=cm_deps,
+        log.info("Case management agent starting for alert %s...", alert.alert_id[:8])
+        cm_result = await asyncio.wait_for(
+            case_management_agent.run(
+                f"Investigate alert {alert.alert_id}. "
+                f"Rule: '{alert.rule.name}'. "
+                f"Matched events: {len(alert.matched_events)}. "
+                f"Matched IOCs: {alert.matched_iocs}.",
+                deps=cm_deps,
+            ),
+            timeout=AGENT_TIMEOUT,
         )
         reasoning: AnalystReasoning = cm_result.output
 
