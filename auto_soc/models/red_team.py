@@ -11,7 +11,7 @@ class AttackPhase(BaseModel):
     mitre_id: str                    # e.g. "T1566.001"
     description: str
     target_endpoint: str             # Hostname from SystemEmulator
-    generated_events: list[SIEMEvent] = []
+    generated_events: list[dict] = []   # raw dicts; full SIEMEvents are in the SIEM
     delay_seconds: int = 60
 
 

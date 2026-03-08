@@ -17,6 +17,15 @@ import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
+# ── Logfire observability ──────────────────────────────────────────────────────
+# Reads LOGFIRE_TOKEN from env/.env automatically.
+# Shows every agent step, tool call, and LLM message in the Logfire UI.
+import logfire
+from dotenv import load_dotenv
+load_dotenv()
+logfire.configure()
+logfire.instrument_pydantic_ai()
+
 # ── Logging setup ─────────────────────────────────────────────────────────────
 # Emit to stdout so `tee` captures it alongside print() output.
 _handler = logging.StreamHandler(sys.stdout)
@@ -41,8 +50,9 @@ log.setLevel(logging.DEBUG)
 log.addHandler(_handler)
 log.propagate = False
 
-# Agent timeout in seconds — bail if the LLM loops forever
-AGENT_TIMEOUT = 180
+# Agent timeout in seconds — 1200s = 20 min, needed for qwen2.5:32b on CPU
+# (~3 min per call × 4+ tool-calling round-trips per autonomous agent)
+AGENT_TIMEOUT = 1200
 
 from auto_soc.models.threat_intel import RelevanceConfig
 from auto_soc.models.red_team import RedTeamConfig
@@ -158,14 +168,24 @@ async def run_simulation(config: SimulationConfig | None = None) -> RunReport:
     log.info("Red team agent starting (timeout=%ds)...", AGENT_TIMEOUT)
     rt_result = await asyncio.wait_for(
         red_team_agent.run(
-            "Analyse the watchlist and available endpoints. Plan and execute a realistic "
-            "multi-phase attack scenario using exact IOC values from the watchlist. "
-            "Target a workstation endpoint. Follow ATT&CK kill chain ordering.",
+            "Execute the attack simulation now. "
+            "Step 1: call get_watchlist(). "
+            "Step 2: call get_available_targets(). "
+            "Step 3: call generate_attack_events() for 2-3 ATT&CK phases (T1566 phishing, T1059 execution, T1071 C2). "
+            "Step 4: call inject_scenario() with the results.",
             deps=rt_deps,
         ),
         timeout=AGENT_TIMEOUT,
     )
-    scenario = rt_result.output
+    # The agent's final output is a text summary (output_type=str).
+    # The real scenario is built by the inject_scenario tool and stored in rt_deps.scenarios.
+    log.info("Red team agent summary: %s", rt_result.output[:200] if rt_result.output else "(none)")
+    if rt_deps.scenarios:
+        scenario = rt_deps.scenarios[-1]
+    else:
+        # Agent completed but never called inject_scenario — create minimal record
+        from auto_soc.models.red_team import AttackScenario as _AS
+        scenario = _AS(name="(no scenario injected)", phases=[])
     attack_event_count = sum(len(p.generated_events) for p in scenario.phases)
     report.attack_events = attack_event_count
     print(f"  Scenario: '{scenario.name}' — {len(scenario.phases)} phases, {attack_event_count} events injected\n")
