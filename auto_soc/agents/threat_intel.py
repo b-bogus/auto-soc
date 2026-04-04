@@ -16,7 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
-from auto_soc.utils.ollama_model import make_ollama_model
+from auto_soc.utils.ollama_model import make_model
 from auto_soc.config import settings
 
 from auto_soc.models.threat_intel import IOC, TTP, ThreatIntelReport, RelevanceConfig
@@ -39,7 +39,7 @@ class BatchRelevanceResult(BaseModel):
 
 # One-shot structured extraction agent (not an autonomous loop)
 _relevance_agent = Agent(
-    make_ollama_model(),
+    make_model(),
     output_type=BatchRelevanceResult,
     system_prompt=(
         "You are a Threat Intelligence analyst at a financial institution. "

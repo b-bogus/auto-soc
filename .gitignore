@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Local notes (not for repo)
+notes/
+
 # Runtime output
 output/
 

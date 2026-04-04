@@ -22,7 +22,7 @@ class AnalystReasoning(BaseModel):
     hypothesis: str
     evidence_for: list[str]
     evidence_against: list[str]
-    confidence: float                # 0.0 – 1.0
+    confidence: float = Field(ge=0.0, le=1.0)  # 0.0 – 1.0
     verdict: Literal["true_positive", "false_positive", "benign_true_positive", "inconclusive"]
     recommended_actions: list[MitigationAction] = []
 

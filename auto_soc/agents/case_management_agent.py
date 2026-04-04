@@ -10,7 +10,7 @@ Given a SIEMAlert, the agent autonomously:
 from dataclasses import dataclass
 
 from pydantic_ai import Agent, RunContext
-from auto_soc.utils.ollama_model import make_ollama_model
+from auto_soc.utils.ollama_model import make_model
 from auto_soc.config import settings
 
 from auto_soc.models.siem import SIEMAlert, SIEMEvent
@@ -28,18 +28,19 @@ class CaseManagementDeps:
 
 
 case_management_agent = Agent(
-    make_ollama_model(),
+    make_model(),
     deps_type=CaseManagementDeps,
     output_type=AnalystReasoning,
     system_prompt="""You are a Tier 2 SOC Analyst at a financial institution.
 You receive a SIEM alert and must determine whether it is a true positive or false positive.
 
 Your workflow:
-1. Call get_alert_events() to see the events that triggered the alert
-2. Call get_event_context() on the most suspicious event to gather surrounding activity
-3. Call get_ioc_details() to understand the threat context of involved IOCs
-4. Weigh evidence for and against your hypothesis
-5. Return a structured AnalystReasoning with verdict and recommended_actions
+1. Call search_past_incidents() with IOCs/IPs/domains from the alert to check institutional memory
+2. Call get_alert_events() to see the events that triggered the alert
+3. Call get_event_context() on the most suspicious event to gather surrounding activity
+4. Call get_ioc_details() to understand the threat context of involved IOCs
+5. Weigh evidence for and against your hypothesis (use past history to inform confidence)
+6. Return a structured AnalystReasoning with verdict and recommended_actions
 
 Be specific in evidence_for and evidence_against — cite hostnames, IPs, process names.
 For true_positive verdict, always include at least one concrete MitigationAction.""",
@@ -129,3 +130,57 @@ async def get_ttp_details(
                 "description": ttp.description,
             })
     return results
+
+
+@case_management_agent.tool
+async def search_past_incidents(
+    ctx: RunContext[CaseManagementDeps],
+    query: str,
+) -> list[dict]:
+    """Search past triage incidents from Azure AI Search for institutional memory.
+
+    Use this to check if IOCs, IPs, domains, or attack patterns have been seen before.
+    Pass the raw IOC values as the query (e.g. '45.155.205.233 evil-update.net').
+    Returns matching incidents from previous simulation runs with their verdicts and actions taken.
+    """
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    endpoint = settings.ai_search_endpoint
+    key = settings.ai_search_key
+    index = settings.ai_search_index
+
+    if not key:
+        return [{"note": "AI Search not configured (AI_SEARCH_KEY missing)"}]
+
+    url = (
+        f"{endpoint}/indexes/{index}/docs"
+        f"?api-version=2024-07-01"
+        f"&search={urllib.parse.quote(query)}"
+        f"&$top=5"
+        f"&$select=run_id,run_date,title,verdict,confidence,hypothesis,evidence_for,evidence_against,iocs,actions"
+    )
+    req = urllib.request.Request(url, headers={"api-key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            import json
+            data = json.loads(resp.read())
+            hits = data.get("value", [])
+            if not hits:
+                return [{"note": "No matching past incidents found."}]
+            return [
+                {
+                    "run_id": h.get("run_id"),
+                    "run_date": h.get("run_date"),
+                    "title": h.get("title"),
+                    "verdict": h.get("verdict"),
+                    "confidence": h.get("confidence"),
+                    "hypothesis": h.get("hypothesis"),
+                    "iocs": h.get("iocs") or [],
+                    "actions": h.get("actions") or [],
+                }
+                for h in hits
+            ]
+    except urllib.error.URLError as e:
+        return [{"error": str(e)}]

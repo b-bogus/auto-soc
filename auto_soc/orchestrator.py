@@ -12,10 +12,12 @@ Phases:
 """
 import uuid
 import asyncio
+import json
 import logging
 import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # ── Logfire observability ──────────────────────────────────────────────────────
 # Reads LOGFIRE_TOKEN from env/.env automatically.
@@ -274,6 +276,98 @@ async def run_simulation(config: SimulationConfig | None = None) -> RunReport:
     if report.detection_rate is not None:
         print(f"  Detection rate:   {report.detection_rate:.0%}")
     print(f"{'─'*40}\n")
+
+    # ── Save report to disk ───────────────────────────────────────────────────
+    output_dir = Path(__file__).parent.parent / "output"
+    output_dir.mkdir(exist_ok=True)
+    output_file = output_dir / f"{run_id}.json"
+
+    report_dict = {
+        "run_id": report.run_id,
+        "started_at": report.started_at.isoformat(),
+        "completed_at": report.completed_at.isoformat() if report.completed_at else None,
+        "ioc_count": report.ioc_count,
+        "ttp_count": report.ttp_count,
+        "background_events": report.background_events,
+        "attack_events": report.attack_events,
+        "alerts_fired": report.alerts_fired,
+        "incidents_created": report.incidents_created,
+        "true_positives": report.true_positives,
+        "false_positives": report.false_positives,
+        "detection_rate": report.detection_rate,
+        "incidents": [i.model_dump(mode="json") for i in report.incidents],
+    }
+    output_file.write_text(json.dumps(report_dict, indent=2))
+    print(f"  Report saved to: {output_file}")
+
+    # ── Upload to ADLS ────────────────────────────────────────────────────────
+    try:
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobServiceClient
+        from auto_soc.config import settings as _s
+        credential = DefaultAzureCredential()
+        blob_client = BlobServiceClient(
+            account_url=f"https://{_s.adls_account}.blob.core.windows.net",
+            credential=credential,
+        ).get_blob_client(container=_s.adls_container, blob=f"{run_id}.json")
+        blob_client.upload_blob(json.dumps(report_dict, indent=2), overwrite=True)
+        print(f"  Report uploaded to ADLS: {_s.adls_container}/{run_id}.json\n")
+    except Exception as e:
+        print(f"  ADLS upload skipped: {e}\n")
+
+    # ── Push per-incident documents to AI Search ──────────────────────────────
+    # The blob indexer can't reach inside nested incidents[], so we push directly.
+    # Each incident becomes a searchable document with IOCs, verdict, and actions.
+    try:
+        import urllib.request as _urlreq
+        import urllib.parse as _urlparse
+        from auto_soc.config import settings as _s
+
+        if _s.ai_search_key and report.incidents:
+            run_date_str = report.started_at.strftime("%Y-%m-%d")
+            docs = []
+            for inc in report.incidents:
+                r = inc.analyst_reasoning
+                # Extract IOC values from matched events (via source_alert_id → alert)
+                ioc_values = list(inc.mitigation_actions and
+                    {a.target for a in inc.mitigation_actions if a.target} or set())
+                action_strs = [
+                    f"{a.action_type}({a.target})" + (f": {a.notes}" if a.notes else "")
+                    for a in (inc.mitigation_actions or [])
+                ]
+                docs.append({
+                    "@search.action": "mergeOrUpload",
+                    "id": f"{run_id}-{inc.source_alert_id[:8]}",
+                    "run_id": run_id,
+                    "run_date": run_date_str,
+                    "title": inc.title,
+                    "verdict": r.verdict if r else None,
+                    "confidence": r.confidence if r else None,
+                    "hypothesis": r.hypothesis if r else None,
+                    "summary": r.summary if r else None,
+                    "evidence_for": list(r.evidence_for) if r and r.evidence_for else [],
+                    "evidence_against": list(r.evidence_against) if r and r.evidence_against else [],
+                    "mitre_ids": list(r.mitre_ids) if r and r.mitre_ids else [],
+                    "iocs": ioc_values,
+                    "actions": action_strs,
+                })
+
+            payload = json.dumps({"value": docs}).encode()
+            url = (f"{_s.ai_search_endpoint}/indexes/{_s.ai_search_index}"
+                   f"/docs/index?api-version=2024-07-01")
+            req = _urlreq.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json", "api-key": _s.ai_search_key},
+                method="POST",
+            )
+            with _urlreq.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read())
+                pushed = sum(1 for d in result.get("value", []) if d.get("status"))
+            print(f"  AI Search: {pushed}/{len(docs)} incidents indexed\n")
+        else:
+            print(f"  AI Search push skipped (key not set or no incidents)\n")
+    except Exception as e:
+        print(f"  AI Search push skipped: {e}\n")
 
     return report
 

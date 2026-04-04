@@ -40,6 +40,14 @@ class _OllamaCompatModel(OpenAIChatModel):
         return result
 
 
+def make_model():
+    """Return the configured LLM model — Azure or Ollama based on LLM_PROVIDER setting."""
+    if settings.llm_provider == "azure":
+        from auto_soc.utils.azure_model import make_azure_model
+        return make_azure_model()
+    return make_ollama_model()
+
+
 def make_ollama_model() -> _OllamaCompatModel:
     """Return a patched Ollama model using settings from config/env.
 

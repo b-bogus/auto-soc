@@ -8,13 +8,13 @@ It uses tools to inspect the environment and inject attack events into the SIEM.
 import uuid
 import random
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic_ai import Agent, RunContext
-from auto_soc.utils.ollama_model import make_ollama_model
+from auto_soc.utils.ollama_model import make_model
 from auto_soc.config import settings
 
-from auto_soc.models.siem import SIEMEvent, CorrelationRule
+from auto_soc.models.siem import SIEMEvent
 from auto_soc.models.red_team import AttackPhase, AttackScenario, RedTeamConfig
 
 
@@ -26,10 +26,11 @@ class RedTeamDeps:
     available_endpoints: list[dict]     # [{"hostname": ..., "ip": ..., "role": ...}]
     config: RedTeamConfig
     scenarios: list[AttackScenario]     # populated by the agent during its run
+    staged_phases: list[dict] = field(default_factory=list)  # buffer: {mitre_id, description, events}
 
 
 red_team_agent = Agent(
-    make_ollama_model(),
+    make_model(),
     deps_type=RedTeamDeps,
     output_type=str,
     retries=3,
@@ -39,7 +40,7 @@ You MUST follow these exact steps by calling the tools in order:
 STEP 1: Call get_watchlist() to retrieve available IOCs and TTPs.
 STEP 2: Call get_available_targets() to retrieve available endpoints.
 STEP 3: Call generate_attack_events() for each attack phase, using a real IOC value from Step 1 and a real hostname from Step 2.
-STEP 4: Call inject_scenario() with the scenario_name, target_endpoint, and all phases with their events.
+STEP 4: Call inject_scenario() with only the scenario_name and target_endpoint. Events are assembled automatically from your generate_attack_events calls — do NOT pass events.
 
 DO NOT describe your plan in text. DO NOT skip any step. Execute all 4 steps by calling the tools.
 After inject_scenario() is called, briefly summarize what you did in one sentence.""",
@@ -79,22 +80,30 @@ async def generate_attack_events(
     ioc_value: str,
     ioc_type: str,
     description: str,
-) -> list[dict]:
+) -> dict:
     """
-    Generate realistic SIEMEvents for one attack phase.
-    Returns a list of event dicts. The agent calls this once per phase.
+    Generate realistic SIEMEvents for one attack phase and stage them for injection.
+    Returns a confirmation dict. The agent calls this once per phase.
     """
     ts = datetime.now(timezone.utc)
     events = []
 
     # Map MITRE tactic to realistic event pattern
     if mitre_id.startswith("T1566"):  # Phishing / Initial Access
+        if ioc_type == "email":
+            sender = ioc_value
+            extra_fields = {"src_email": ioc_value}
+        elif ioc_type == "domain":
+            sender = f"spoofed-sender@{ioc_value}"
+            extra_fields = {"domain": ioc_value}
+        else:
+            sender = "spoofed-sender@evil.com"
+            extra_fields = {}
         events.append(_make_event(
             source="email_gateway", severity="high", ts=ts,
-            raw=f"DELIVERED phish email with attachment to {target_hostname} from spoofed-sender@{ioc_value if ioc_type == 'domain' else 'evil.com'}",
+            raw=f"DELIVERED phish email with attachment to {target_hostname} from {sender}",
             fields={"action": "email_delivered", "hostname": target_hostname,
-                    "src_ip": target_ip, "domain": ioc_value if ioc_type == "domain" else None,
-                    "user": f"CORP\\user1"}
+                    "src_ip": target_ip, "user": "CORP\\user1", **extra_fields}
         ))
     elif mitre_id.startswith("T1059"):  # Script Execution
         events.append(_make_event(
@@ -139,37 +148,12 @@ async def generate_attack_events(
                     "domain": ioc_value if ioc_type == "domain" else None}
         ))
 
-    return [e.model_dump(mode="json") for e in events]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _coerce_siem_event(e: dict) -> "SIEMEvent":
-    """Map any LLM-generated event dict to a valid SIEMEvent, handling creative field names."""
-    from datetime import datetime, timezone
-    SEVERITY_VALID = {"low", "medium", "high", "critical"}
-
-    # source_system: accept 'agent', 'source', 'system', 'sensor'
-    source = (e.get("source_system") or e.get("agent") or e.get("source") or
-              e.get("system") or e.get("sensor") or "edr")
-    # raw_log: accept 'message', 'log', 'description', 'event', 'details'
-    raw = (e.get("raw_log") or e.get("message") or e.get("log") or
-           e.get("description") or e.get("event") or e.get("details") or str(e))
-    # severity: validate and default to 'medium'
-    sev_raw = str(e.get("severity") or e.get("level") or "medium").lower()
-    severity = sev_raw if sev_raw in SEVERITY_VALID else "medium"
-
-    return SIEMEvent(
-        timestamp=datetime.now(timezone.utc),
-        source_system=str(source)[:64],
-        severity=severity,  # type: ignore[arg-type]
-        raw_log=str(raw)[:512],
-        parsed_fields={k: v for k, v in e.items()
-                       if k not in ("source_system", "agent", "source", "system", "sensor",
-                                    "raw_log", "message", "log", "description", "event",
-                                    "details", "severity", "level", "event_id", "timestamp")
-                       and v is not None},
-    )
+    ctx.deps.staged_phases.append({
+        "mitre_id": mitre_id,
+        "description": description,
+        "events": events,
+    })
+    return {"staged": True, "phase_index": len(ctx.deps.staged_phases) - 1, "event_count": len(events)}
 
 
 @red_team_agent.tool
@@ -177,25 +161,23 @@ async def inject_scenario(
     ctx: RunContext[RedTeamDeps],
     scenario_name: str,
     target_endpoint: str,
-    phases: list[dict],
 ) -> dict:
     """
-    Inject a complete attack scenario into the SIEM.
-    phases is a list of dicts with keys: mitre_id, description, events (list of event dicts).
+    Inject a complete attack scenario into the SIEM using all staged phases from
+    previous generate_attack_events calls.
     Returns {"scenario_id": ..., "events_injected": int, "phases": int}.
     """
     scenario_id = str(uuid.uuid4())
     all_events: list[SIEMEvent] = []
     attack_phases: list[AttackPhase] = []
 
-    for i, phase_dict in enumerate(phases):
-        raw_events = phase_dict.get("events", [])
-        phase_events = [_coerce_siem_event(e) for e in raw_events if e]
+    for i, phase_dict in enumerate(ctx.deps.staged_phases):
+        phase_events = phase_dict["events"]
         all_events.extend(phase_events)
         attack_phases.append(AttackPhase(
             order=i + 1,
-            mitre_id=phase_dict.get("mitre_id", "T0000"),
-            description=phase_dict.get("description", ""),
+            mitre_id=phase_dict["mitre_id"],
+            description=phase_dict["description"],
             target_endpoint=target_endpoint,
             generated_events=[e.model_dump(mode="json") for e in phase_events],
         ))
